@@ -194,8 +194,57 @@ int head_update(const ObjectID *new_commit) {
 //
 // Returns 0 on success, -1 on error.
 int commit_create(const char *message, ObjectID *commit_id_out) {
-    // TODO: Implement commit creation
-    // (See Lab Appendix for logical steps)
-    (void)message; (void)commit_id_out;
-    return -1;
+    printf("Debug: Starting commit_create...\n");
+
+    // 1. Build a tree object from the staging area
+    ObjectID tree_id;
+    if (tree_from_index(&tree_id) != 0) {
+        fprintf(stderr, "Failed to create tree from index.\n");
+        return -1;
+    }
+    printf("Debug: Tree created successfully.\n");
+
+    // 2. Initialize the Commit struct
+    Commit commit;
+    memset(&commit, 0, sizeof(Commit));
+    commit.tree = tree_id;
+
+    // 3. Read current HEAD for parent
+    if (head_read(&commit.parent) == 0) {
+        commit.has_parent = 1;
+        printf("Debug: Parent commit found.\n");
+    } else {
+        commit.has_parent = 0;
+        printf("Debug: Initial commit (no parent).\n");
+    }
+
+    // 4. Metadata
+    strncpy(commit.author, pes_author(), sizeof(commit.author) - 1);
+    commit.timestamp = (uint64_t)time(NULL);
+    if (message) {
+        strncpy(commit.message, message, sizeof(commit.message) - 1);
+    }
+    printf("Debug: Metadata populated.\n");
+
+    // 5. Serialize
+    void *data = NULL;
+    size_t len = 0;
+    printf("Debug: Calling commit_serialize...\n");
+    if (commit_serialize(&commit, &data, &len) != 0) {
+        fprintf(stderr, "Failed to serialize commit.\n");
+        return -1;
+    }
+
+    // 6. Write to Object Store
+    printf("Debug: Calling object_write...\n");
+    if (object_write(OBJ_COMMIT, data, len, commit_id_out) != 0) {
+        fprintf(stderr, "Failed to write commit object.\n");
+        free(data);
+        return -1;
+    }
+    free(data);
+
+    // 7. Update HEAD
+    printf("Debug: Calling head_update...\n");
+    return head_update(commit_id_out);
 }
