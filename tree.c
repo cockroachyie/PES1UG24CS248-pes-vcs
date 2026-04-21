@@ -8,8 +8,8 @@
 //
 // Example single entry (conceptual):
 //   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
-
 #include "tree.h"
+#include "index.h"    // ADD THIS LINE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,7 +28,6 @@
 uint32_t get_file_mode(const char *path) {
     struct stat st;
     if (lstat(path, &st) != 0) return 0;
-
     if (S_ISDIR(st.st_mode))  return MODE_DIR;
     if (st.st_mode & S_IXUSR) return MODE_EXEC;
     return MODE_FILE;
@@ -54,7 +53,6 @@ int tree_parse(const void *data, size_t len, Tree *tree_out) {
         if (mode_len >= sizeof(mode_str)) return -1;
         memcpy(mode_str, ptr, mode_len);
         entry->mode = strtol(mode_str, NULL, 8);
-
         ptr = space + 1; // Skip space
 
         // 2. Safely find the null terminator for the name
@@ -65,7 +63,6 @@ int tree_parse(const void *data, size_t len, Tree *tree_out) {
         if (name_len >= sizeof(entry->name)) return -1;
         memcpy(entry->name, ptr, name_len);
         entry->name[name_len] = '\0'; // Ensure null-terminated
-
         ptr = null_byte + 1; // Skip null byte
 
         // 3. Read the 32-byte binary hash
@@ -75,6 +72,7 @@ int tree_parse(const void *data, size_t len, Tree *tree_out) {
 
         tree_out->count++;
     }
+
     return 0;
 }
 
@@ -114,7 +112,105 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
     return 0;
 }
 
-// ─── TODO: Implement these ──────────────────────────────────────────────────
+// ─── IMPLEMENTED ────────────────────────────────────────────────────────────
+
+// Helper function to build tree recursively
+// prefix: the directory path we're building a tree for (e.g., "", "src", "src/utils")
+// Returns 0 on success, -1 on error
+static int write_tree_for_path(const Index *index, const char *prefix, ObjectID *tree_id_out) {
+    Tree tree;
+    tree.count = 0;
+    
+    size_t prefix_len = strlen(prefix);
+    
+    // Collect all immediate children (files and directories) at this level
+    for (int i = 0; i < index->count; i++) {
+        const IndexEntry *entry = &index->entries[i];
+        
+        // Skip entries that don't start with our prefix
+        if (prefix_len > 0) {
+            if (strncmp(entry->path, prefix, prefix_len) != 0) continue;
+            if (entry->path[prefix_len] != '/') continue;
+        }
+        
+        // Find the relative path after the prefix
+        const char *rel_path = (prefix_len == 0) ? entry->path : entry->path + prefix_len + 1;
+        
+        // Find the next slash to determine if this is a direct child or deeper
+        const char *slash = strchr(rel_path, '/');
+        
+        if (slash == NULL) {
+            // This is a direct file child - add it to the tree
+            if (tree.count >= MAX_TREE_ENTRIES) return -1;
+            
+            TreeEntry *te = &tree.entries[tree.count];
+            te->mode = entry->mode;
+            te->hash = entry->hash;
+            strncpy(te->name, rel_path, sizeof(te->name) - 1);
+            te->name[sizeof(te->name) - 1] = '\0';
+            tree.count++;
+        } else {
+            // This is a subdirectory - extract the directory name
+            size_t dir_len = slash - rel_path;
+            char dir_name[256];
+            if (dir_len >= sizeof(dir_name)) continue;
+            
+            memcpy(dir_name, rel_path, dir_len);
+            dir_name[dir_len] = '\0';
+            
+            // Check if we've already processed this directory
+            int already_added = 0;
+            for (int j = 0; j < tree.count; j++) {
+                if (strcmp(tree.entries[j].name, dir_name) == 0) {
+                    already_added = 1;
+                    break;
+                }
+            }
+            
+            if (!already_added) {
+                // Build the full path for the subdirectory
+                char subdir_path[512];
+                if (prefix_len == 0) {
+                    snprintf(subdir_path, sizeof(subdir_path), "%s", dir_name);
+                } else {
+                    snprintf(subdir_path, sizeof(subdir_path), "%s/%s", prefix, dir_name);
+                }
+                
+                // Recursively build the tree for this subdirectory
+                ObjectID subdir_tree_id;
+                if (write_tree_for_path(index, subdir_path, &subdir_tree_id) < 0) {
+                    return -1;
+                }
+                
+                // Add the subdirectory to our tree
+                if (tree.count >= MAX_TREE_ENTRIES) return -1;
+                
+                TreeEntry *te = &tree.entries[tree.count];
+                te->mode = MODE_DIR;
+                te->hash = subdir_tree_id;
+                strncpy(te->name, dir_name, sizeof(te->name) - 1);
+                te->name[sizeof(te->name) - 1] = '\0';
+                tree.count++;
+            }
+        }
+    }
+    
+    // If empty tree, return error
+    if (tree.count == 0) return -1;
+    
+    // Serialize the tree
+    void *tree_data;
+    size_t tree_len;
+    if (tree_serialize(&tree, &tree_data, &tree_len) < 0) {
+        return -1;
+    }
+    
+    // Write the tree object to the store
+    int result = object_write(OBJ_TREE, tree_data, tree_len, tree_id_out);
+    free(tree_data);
+    
+    return result;
+}
 
 // Build a tree hierarchy from the current index and write all tree
 // objects to the object store.
@@ -130,8 +226,13 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //
 // Returns 0 on success, -1 on error.
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    // Load the index
+    Index index;
+    if (index_load(&index) < 0) return -1;
+    
+    // If index is empty, nothing to commit
+    if (index.count == 0) return -1;
+    
+    // Build the root tree (empty prefix = root)
+    return write_tree_for_path(&index, "", id_out);
 }

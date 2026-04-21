@@ -60,7 +60,7 @@ int index_remove(Index *index, const char *path) {
 int index_status(const Index *index) {
     printf("Staged changes:\n");
     int staged_count = 0;
-    // Note: A true Git implementation deeply diffs against the HEAD tree here. 
+    // Note: A true Git implementation deeply diffs against the HEAD tree here.
     // For this lab, displaying indexed files represents the staging intent.
     for (int i = 0; i < index->count; i++) {
         printf("  staged:     %s\n", index->entries[i].path);
@@ -103,11 +103,11 @@ int index_status(const Index *index) {
             int is_tracked = 0;
             for (int i = 0; i < index->count; i++) {
                 if (strcmp(index->entries[i].path, ent->d_name) == 0) {
-                    is_tracked = 1; 
+                    is_tracked = 1;
                     break;
                 }
             }
-            
+
             if (!is_tracked) {
                 struct stat st;
                 stat(ent->d_name, &st);
@@ -125,7 +125,12 @@ int index_status(const Index *index) {
     return 0;
 }
 
-// ─── TODO: Implement these ───────────────────────────────────────────────────
+// ─── IMPLEMENTED ────────────────────────────────────────────────────────────
+
+// Helper for qsort
+static int compare_index_entries(const void *a, const void *b) {
+    return strcmp(((const IndexEntry *)a)->path, ((const IndexEntry *)b)->path);
+}
 
 // Load the index from .pes/index.
 //
@@ -135,10 +140,39 @@ int index_status(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_load(Index *index) {
-    // TODO: Implement index loading
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    index->count = 0;
+    
+    FILE *f = fopen(INDEX_FILE, "r");
+    if (!f) {
+        // File doesn't exist yet - this is OK, return empty index
+        return 0;
+    }
+    
+    char hash_hex[HASH_HEX_SIZE + 1];
+    unsigned int mode;
+    unsigned long mtime_sec;
+    unsigned int size;
+    char path[512];
+    
+    while (fscanf(f, "%o %64s %lu %u %511s", &mode, hash_hex, &mtime_sec, &size, path) == 5) {
+        if (index->count >= MAX_INDEX_ENTRIES) {
+            fclose(f);
+            return -1;
+        }
+        
+        IndexEntry *entry = &index->entries[index->count];
+        entry->mode = mode;
+        hex_to_hash(hash_hex, &entry->hash);
+        entry->mtime_sec = mtime_sec;
+        entry->size = size;
+        strncpy(entry->path, path, sizeof(entry->path) - 1);
+        entry->path[sizeof(entry->path) - 1] = '\0';
+        
+        index->count++;
+    }
+    
+    fclose(f);
+    return 0;
 }
 
 // Save the index to .pes/index atomically.
@@ -152,10 +186,38 @@ int index_load(Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_save(const Index *index) {
-    // TODO: Implement atomic index saving
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    // Sort entries by path
+    Index sorted = *index;
+    qsort(sorted.entries, sorted.count, sizeof(IndexEntry), compare_index_entries);
+    
+    // Write to temp file
+    char temp_path[512];
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp.%d", INDEX_FILE, getpid());
+    
+    FILE *f = fopen(temp_path, "w");
+    if (!f) return -1;
+    
+    for (int i = 0; i < sorted.count; i++) {
+        const IndexEntry *entry = &sorted.entries[i];
+        char hash_hex[HASH_HEX_SIZE + 1];
+        hash_to_hex(&entry->hash, hash_hex);
+        
+        fprintf(f, "%o %s %lu %u %s\n",
+                entry->mode, hash_hex, entry->mtime_sec, entry->size, entry->path);
+    }
+    
+    // Flush and sync
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    
+    // Atomic rename
+    if (rename(temp_path, INDEX_FILE) < 0) {
+        unlink(temp_path);
+        return -1;
+    }
+    
+    return 0;
 }
 
 // Stage a file for the next commit.
