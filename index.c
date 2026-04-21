@@ -25,7 +25,7 @@
 #include <dirent.h>
 
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
-
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 // Find an index entry by path (linear scan).
 IndexEntry* index_find(Index *index, const char *path) {
     for (int i = 0; i < index->count; i++) {
@@ -60,7 +60,7 @@ int index_remove(Index *index, const char *path) {
 int index_status(const Index *index) {
     printf("Staged changes:\n");
     int staged_count = 0;
-    // Note: A true Git implementation deeply diffs against the HEAD tree here.
+    // Note: A true Git implementation deeply diffs against the HEAD tree here. 
     // For this lab, displaying indexed files represents the staging intent.
     for (int i = 0; i < index->count; i++) {
         printf("  staged:     %s\n", index->entries[i].path);
@@ -103,11 +103,11 @@ int index_status(const Index *index) {
             int is_tracked = 0;
             for (int i = 0; i < index->count; i++) {
                 if (strcmp(index->entries[i].path, ent->d_name) == 0) {
-                    is_tracked = 1;
+                    is_tracked = 1; 
                     break;
                 }
             }
-
+            
             if (!is_tracked) {
                 struct stat st;
                 stat(ent->d_name, &st);
@@ -125,12 +125,7 @@ int index_status(const Index *index) {
     return 0;
 }
 
-// ─── IMPLEMENTED ────────────────────────────────────────────────────────────
-
-// Helper for qsort
-static int compare_index_entries(const void *a, const void *b) {
-    return strcmp(((const IndexEntry *)a)->path, ((const IndexEntry *)b)->path);
-}
+// ─── TODO: Implement these ───────────────────────────────────────────────────
 
 // Load the index from .pes/index.
 //
@@ -141,40 +136,39 @@ static int compare_index_entries(const void *a, const void *b) {
 // Returns 0 on success, -1 on error.
 int index_load(Index *index) {
     index->count = 0;
-    
     FILE *f = fopen(INDEX_FILE, "r");
     if (!f) {
-        // File doesn't exist yet - this is OK, return empty index
-        return 0;
+        return 0; 
     }
-    
-    char hash_hex[HASH_HEX_SIZE + 1];
-    unsigned int mode;
-    unsigned long mtime_sec;
-    unsigned int size;
-    char path[512];
-    
-    while (fscanf(f, "%o %64s %lu %u %511s", &mode, hash_hex, &mtime_sec, &size, path) == 5) {
-        if (index->count >= MAX_INDEX_ENTRIES) {
-            fclose(f);
-            return -1;
-        }
-        
+
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
         IndexEntry *entry = &index->entries[index->count];
-        entry->mode = mode;
-        hex_to_hash(hash_hex, &entry->hash);
-        entry->mtime_sec = mtime_sec;
-        entry->size = size;
-        strncpy(entry->path, path, sizeof(entry->path) - 1);
-        entry->path[sizeof(entry->path) - 1] = '\0';
+        char hex[HASH_HEX_SIZE + 1];
+
+        // Parse exactly: [mode] [hash] [path]
+        int parsed = sscanf(line, "%o %64s %[^\n]", &entry->mode, hex, entry->path);
         
-        index->count++;
+        if (parsed == 3) {
+            // Clean up any leading spaces that sscanf might have caught before the path
+            char *p = entry->path;
+            while (*p == ' ' || *p == '\t') p++;
+            if (p != entry->path) {
+                memmove(entry->path, p, strlen(p) + 1);
+            }
+
+            if (hex_to_hash(hex, &entry->hash) == 0) {
+                // Reset metadata in memory since we aren't storing it
+                entry->mtime_sec = 0;
+                entry->size = 0;
+                index->count++;
+            }
+        }
     }
-    
+
     fclose(f);
     return 0;
 }
-
 // Save the index to .pes/index atomically.
 //
 // HINTS - Useful functions and syscalls:
@@ -185,41 +179,36 @@ int index_load(Index *index) {
 //   - rename                           : atomically moving the temp file over the old index
 //
 // Returns 0 on success, -1 on error.
+        // Write line including mtime and size so `pes status` can run quickly
 int index_save(const Index *index) {
-    // Sort entries by path
-    Index sorted = *index;
-    qsort(sorted.entries, sorted.count, sizeof(IndexEntry), compare_index_entries);
-    
-    // Write to temp file
     char temp_path[512];
-    snprintf(temp_path, sizeof(temp_path), "%s.tmp.%d", INDEX_FILE, getpid());
-    
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp", INDEX_FILE);
+
     FILE *f = fopen(temp_path, "w");
-    if (!f) return -1;
-    
-    for (int i = 0; i < sorted.count; i++) {
-        const IndexEntry *entry = &sorted.entries[i];
-        char hash_hex[HASH_HEX_SIZE + 1];
-        hash_to_hex(&entry->hash, hash_hex);
-        
-        fprintf(f, "%o %s %lu %u %s\n",
-                entry->mode, hash_hex, entry->mtime_sec, entry->size, entry->path);
-    }
-    
-    // Flush and sync
-    fflush(f);
-    fsync(fileno(f));
-    fclose(f);
-    
-    // Atomic rename
-    if (rename(temp_path, INDEX_FILE) < 0) {
-        unlink(temp_path);
+    if (!f) {
+        perror("Failed to open temp index file for writing");
         return -1;
     }
-    
+
+    for (int i = 0; i < index->count; i++) {
+        const IndexEntry *entry = &index->entries[i];
+        
+        char hex[HASH_HEX_SIZE + 1];
+        hash_to_hex(&entry->hash, hex);
+
+        // Write strict 3-field format: [mode] [hash] [path]
+        fprintf(f, "%06o %s %s\n", entry->mode, hex, entry->path);
+    }
+
+    fclose(f);
+
+    if (rename(temp_path, INDEX_FILE) != 0) {
+        perror("Failed to atomically update index file");
+        return -1;
+    }
+
     return 0;
 }
-
 // Stage a file for the next commit.
 //
 // HINTS - Useful functions and syscalls:
@@ -230,8 +219,67 @@ int index_save(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_add(Index *index, const char *path) {
-    // TODO: Implement file staging
-    // (See Lab Appendix for logical steps)
-    (void)index; (void)path;
-    return -1;
+    // 1. Open and read the file's contents
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        perror("Failed to open file for staging");
+        return -1;
+    }
+
+    fseek(f, 0, SEEK_END);
+    size_t size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    void *data = malloc(size > 0 ? size : 1);
+    if (size > 0 && fread(data, 1, size, f) != size) {
+        perror("Failed to read file");
+        free(data);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    // 2. Write the file as a blob object to the object store
+    ObjectID id;
+    if (object_write(OBJ_BLOB, data, size, &id) != 0) {
+        fprintf(stderr, "Failed to write blob object\n");
+        free(data);
+        return -1;
+    }
+    free(data);
+
+    // 3. Get the file's stat to determine its mode
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        perror("Failed to stat file");
+        return -1;
+    }
+
+    // Git stores regular files as 100644 and executables as 100755
+    mode_t mode = (st.st_mode & S_IXUSR) ? 0100755 : 0100644;
+
+    // 4. Update or add the entry in the index array
+    IndexEntry *entry = index_find(index, path);
+    if (!entry) {
+        // Enforce max entry limit
+        if (index->count >= MAX_INDEX_ENTRIES) {
+            fprintf(stderr, "Error: Maximum index capacity reached.\n");
+            return -1;
+        }
+        entry = &index->entries[index->count++];
+        strncpy(entry->path, path, sizeof(entry->path) - 1);
+        entry->path[sizeof(entry->path) - 1] = '\0';
+    }
+
+    // 5. Populate struct fields
+    entry->mode = mode;
+    entry->hash = id;
+    
+    // We set these to 0 because we simplified our index file to just Mode/Hash/Path
+    // to prevent the pes status text-parsing bug.
+    entry->size = 0;
+    entry->mtime_sec = 0;
+
+    // 6. Save the index to disk so changes persist for the next command!
+    return index_save(index);
 }
